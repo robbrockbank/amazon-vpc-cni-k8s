@@ -39,6 +39,7 @@ import (
 // free them back when the pool size goes above max threshold.
 
 const (
+	envExternalSNAT             = "AWS_VPC_K8S_CNI_EXTERNALSNAT"
 	ipPoolMonitorInterval       = 5 * time.Second
 	maxRetryCheckENI            = 5
 	eniAttachTime               = 10 * time.Second
@@ -163,8 +164,15 @@ func (c *IPAMContext) nodeInit() error {
 	}
 
 	primaryIP := net.ParseIP(c.awsClient.GetLocalIPv4())
+	externalSNAT := false
+	if externalSNATStr := os.Getenv(envExternalSNAT); externalSNATStr != "" {
+		externalSNAT, err = strconv.ParseBool(externalSNATStr)
 
-	err = c.networkClient.SetupHostNetwork(vpcCIDR, &primaryIP)
+		log.Error("Failed to parse "+envExternalSNAT, err.Error())
+		return errors.Wrap(err, "ipamd init: failed to parse "+envExternalSNAT)
+	}
+
+	err = c.networkClient.SetupHostNetwork(vpcCIDR, &primaryIP, externalSNAT)
 	if err != nil {
 		log.Error("Failed to setup host network", err)
 		return errors.Wrap(err, "ipamd init: failed to setup host network")

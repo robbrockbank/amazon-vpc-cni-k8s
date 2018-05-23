@@ -32,6 +32,16 @@ spec:
             value: DEBUG
           - name: AWS_VPC_K8S_CNI_VETHPREFIX
             value: cali
+          # By default, for Calico, we assume a NAT gateway will be used to allow containers to communicate
+          # with the internet. This prevents on-node SNAT of secondary ENIs to primary ENI IP address and
+          # thus ensures the source IP address from containers is not modified unless it egresses through
+          # a NAT gateway. This is important if your VPC is peered with another VPC or network and you need
+          # preservation of source IP, for example you are running Calico in another cluster on a peered
+          # network and need to perform policy based on the container source IPs on this cluster.
+          # If this is not a concern and would rather have SNAT performed on node to avoid the use of a NAT
+          # gateay, set this value to "false"
+          - name: AWS_VPC_K8S_CNI_EXTERNALSNAT
+            value: true
         resources:
           requests:
             cpu: 10m

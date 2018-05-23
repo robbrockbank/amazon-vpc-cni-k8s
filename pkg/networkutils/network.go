@@ -47,7 +47,7 @@ const (
 // NetworkAPIs defines the host level and the eni level network related operations
 type NetworkAPIs interface {
 	// SetupNodeNetwork performs node level network configuration
-	SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP) error
+	SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP, externalSNAT bool) error
 	// SetupENINetwork performs eni level network configuration
 	SetupENINetwork(eniIP string, mac string, table int, subnetCIDR string) error
 }
@@ -67,9 +67,9 @@ func isDuplicateRuleAdd(err error) bool {
 	return strings.Contains(err.Error(), "File exists")
 }
 
-// SetupNodeNetwork performs node level network configuration
+// SetupHostNetwork performs node level network configuration
 // TODO : implement ip rule not to 10.0.0.0/16(vpc'subnet) table main priority  1024
-func (os *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP) error {
+func (os *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP, externalSNAT bool) error {
 
 	hostRule := os.netLink.NewRule()
 	hostRule.Dst = vpcCIDR
@@ -77,18 +77,21 @@ func (os *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP
 	hostRule.Priority = hostRulePriority
 	hostRule.Invert = true
 
-	// if this is a restart, cleanup previous rule first
+	// If this is a restart, cleanup previous rule first
 	err := os.netLink.RuleDel(hostRule)
 	if err != nil && !containsNoSuchRule(err) {
 		log.Errorf("Failed to cleanup old host IP rule: %v", err)
 		return errors.Wrapf(err, "host network setup: failed to delete old host rule")
 	}
 
-	err = os.netLink.RuleAdd(hostRule)
-
-	if err != nil {
-		log.Errorf("Failed to add host IP rule: %v", err)
-		return errors.Wrapf(err, "host network setup: failed to add host rule")
+	// Only include the rule if SNAT is not being handled by an external NAT gateway and needs to be
+	// handled on-node.
+	if !externalSNAT {
+		err = os.netLink.RuleAdd(hostRule)
+		if err != nil {
+			log.Errorf("Failed to add host IP rule: %v", err)
+			return errors.Wrapf(err, "host network setup: failed to add host rule")
+		}
 	}
 
 	ipt, err := iptables.New()
@@ -105,11 +108,19 @@ func (os *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, primaryAddr *net.IP
 		return errors.Wrapf(err, "host network setup: failed to add POSTROUTING rule for primary address %s", primaryAddr)
 	}
 
-	if !exists {
+	if !exists && !externalSNAT {
+		// We are handling SNAT on-node, so include the iptables SNAT POSTROUTING rule.
 		err = ipt.Append("nat", "POSTROUTING", natCmd...)
 
 		if err != nil {
-			return errors.Wrapf(err, "host network setup: failed to append POSTROUTING rule for primary adderss %s", primaryAddr)
+			return errors.Wrapf(err, "host network setup: failed to append POSTROUTING rule for primary address %s", primaryAddr)
+		}
+	} else if exists && externalSNAT {
+		// We are not handling SNAT on-node, so delete the existing iptables SNAT POSTROUTING rule.
+		err = ipt.Delete("nat", "POSTROUTING", natCmd...)
+
+		if err != nil {
+			return errors.Wrapf(err, "host network setup: failed to delete POSTROUTING rule for primary address %s", primaryAddr)
 		}
 	}
 
