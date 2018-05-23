@@ -167,9 +167,10 @@ func (c *IPAMContext) nodeInit() error {
 	externalSNAT := false
 	if externalSNATStr := os.Getenv(envExternalSNAT); externalSNATStr != "" {
 		externalSNAT, err = strconv.ParseBool(externalSNATStr)
-
-		log.Error("Failed to parse "+envExternalSNAT, err.Error())
-		return errors.Wrap(err, "ipamd init: failed to parse "+envExternalSNAT)
+		if err != nil {
+			log.Error("Failed to parse "+envExternalSNAT, err.Error())
+			return errors.Wrap(err, "ipamd init: failed to parse "+envExternalSNAT)
+		}
 	}
 
 	err = c.networkClient.SetupHostNetwork(vpcCIDR, &primaryIP, externalSNAT)

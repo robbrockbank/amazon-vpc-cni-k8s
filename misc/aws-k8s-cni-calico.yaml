@@ -41,7 +41,7 @@ spec:
           # If this is not a concern and would rather have SNAT performed on node to avoid the use of a NAT
           # gateay, set this value to "false"
           - name: AWS_VPC_K8S_CNI_EXTERNALSNAT
-            value: true
+            value: "true"
         resources:
           requests:
             cpu: 10m

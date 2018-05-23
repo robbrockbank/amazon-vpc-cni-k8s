@@ -56,7 +56,7 @@ func main() {
 	ip := net.ParseIP(nodeIP)
 
 	_, cidr, _ := net.ParseCIDR(vpcCIDR)
-	err := hdlr.SetupHostNetwork(cidr, &ip)
+	err := hdlr.SetupHostNetwork(cidr, &ip, false)
 
 	fmt.Printf("SetupNodeNetwork %v", err)
 
