@@ -342,7 +342,7 @@ func (cache *EC2InstanceMetadataCache) setPrimaryENI() error {
 			if err != nil {
 				awsAPIErrInc("GetMetadata", err)
 				log.Errorf("Failed to retrieve owner ID from instance metadata %v", err)
-				return errors.Wrap(err, "set primary eni: failed to retrive ownerID")
+				return errors.Wrap(err, "set primary eni: failed to retrieve ownerID")
 			}
 			log.Debugf("Found account ID: %s", ownerID)
 			cache.accountID = ownerID
@@ -694,7 +694,7 @@ func (cache *EC2InstanceMetadataCache) FreeENI(eniName string) error {
 	_, attachID, err := cache.DescribeENI(eniName)
 	if err != nil {
 		awsUtilsErrInc("FreeENIDescribeENIFailed", err)
-		log.Errorf("Failed to retrive eni %s attachment id %d", eniName, err)
+		log.Errorf("Failed to retrieve eni %s attachment id %d", eniName, err)
 		return errors.Wrap(err, "free eni: failed to retrieve eni's attachment id")
 	}
 
@@ -749,10 +749,10 @@ func (cache *EC2InstanceMetadataCache) deleteENI(eniName string) error {
 		_, err = cache.ec2SVC.DeleteNetworkInterface(deleteInput)
 		awsAPILatency.WithLabelValues("DeleteNetworkInterface", fmt.Sprint(err != nil)).Observe(msSince(start))
 		if err == nil {
-			awsAPIErrInc("DeleteNetworkInterface", err)
 			log.Infof("Successfully deleted eni: %s", eniName)
 			return nil
 		}
+		awsAPIErrInc("DeleteNetworkInterface", err)
 
 		log.Debugf("Not able to delete eni yet (attempt %d/%d): %v ", retry, maxENIDeleteRetries, err)
 		time.Sleep(retryDeleteENIInternal)

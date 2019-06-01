@@ -20,26 +20,44 @@ import (
 
 	"github.com/aws/amazon-vpc-cni-k8s/ipamd"
 	log "github.com/cihub/seelog"
+
+	"github.com/aws/amazon-vpc-cni-k8s/pkg/k8sapi"
 )
 
 const (
 	defaultLogFilePath = "/host/var/log/aws-routed-eni/ipamd.log"
-	version            = "0.1.4"
+	version            = "1.0.0"
 )
 
 func main() {
+	os.Exit(_main())
+}
+
+func _main() int {
 	defer log.Flush()
 	logger.SetupLogger(logger.GetLogFileLocation(defaultLogFilePath))
 
 	log.Infof("Starting L-IPAMD %s  ...", version)
-	aws_k8s_agent, err := ipamd.New()
 
+	kubeClient, err := k8sapi.CreateKubeClient("", "")
 	if err != nil {
-		log.Error("initialization failure", err)
+		log.Errorf("Failed to create client: %v", err)
 		os.Exit(1)
 	}
 
-	go aws_k8s_agent.StartNodeIPPoolManager()
-	go aws_k8s_agent.SetupHTTP()
-	aws_k8s_agent.RunRPCHandler()
+	discoverController := k8sapi.NewController(kubeClient)
+	go discoverController.DiscoverK8SPods()
+
+	awsK8sAgent, err := ipamd.New(discoverController)
+
+	if err != nil {
+		log.Error("initialization failure", err)
+		return 1
+	}
+
+	go awsK8sAgent.StartNodeIPPoolManager()
+	go awsK8sAgent.SetupHTTP()
+	awsK8sAgent.RunRPCHandler()
+
+	return 0
 }

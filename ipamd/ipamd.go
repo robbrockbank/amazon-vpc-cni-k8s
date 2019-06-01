@@ -30,6 +30,7 @@ import (
 
 	"github.com/aws/amazon-vpc-cni-k8s/ipamd/datastore"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/awsutils"
+	"github.com/aws/amazon-vpc-cni-k8s/pkg/docker"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/k8sapi"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/networkutils"
 )
@@ -44,6 +45,8 @@ const (
 	eniAttachTime               = 10 * time.Second
 	defaultWarmENITarget        = 1
 	nodeIPPoolReconcileInterval = 60 * time.Second
+	maxK8SRetries               = 12
+	retryK8SInterval            = 5 * time.Second
 )
 
 var (
@@ -88,6 +91,7 @@ type IPAMContext struct {
 	awsClient     awsutils.APIs
 	dataStore     *datastore.DataStore
 	k8sClient     k8sapi.K8SAPIs
+	dockerClient  docker.APIs
 	networkClient networkutils.NetworkAPIs
 
 	currentMaxAddrsPerENI int
@@ -113,12 +117,13 @@ func prometheusRegister() {
 
 // New retrieves IP address usage information from Instance MetaData service and Kubelet
 // then initializes IP address pool data store
-func New() (*IPAMContext, error) {
+func New(k8sapiClient k8sapi.K8SAPIs) (*IPAMContext, error) {
 	prometheusRegister()
 	c := &IPAMContext{}
 
-	c.k8sClient = k8sapi.New()
+	c.k8sClient = k8sapiClient
 	c.networkClient = networkutils.New()
+	c.dockerClient = docker.New()
 
 	client, err := awsutils.New()
 	if err != nil {
@@ -152,7 +157,7 @@ func (c *IPAMContext) nodeInit() error {
 
 	enis, err := c.awsClient.GetAttachedENIs()
 	if err != nil {
-		log.Error("Failed to retrive ENI info")
+		log.Error("Failed to retrieve ENI info")
 		return errors.New("ipamd init: failed to retrieve attached ENIs info")
 	}
 
@@ -190,7 +195,7 @@ func (c *IPAMContext) nodeInit() error {
 		}
 	}
 
-	usedIPs, err := c.k8sClient.K8SGetLocalPodIPs(c.awsClient.GetLocalIPv4())
+	usedIPs, err := c.getLocalPodsWithRetry()
 	if err != nil {
 		log.Warnf("During ipamd init, failed to get Pod information from Kubelet %v", err)
 		ipamdErrInc("nodeInitK8SGetLocalPodIPsFailed", err)
@@ -200,6 +205,18 @@ func (c *IPAMContext) nodeInit() error {
 	}
 
 	for _, ip := range usedIPs {
+		if ip.Container == "" {
+			log.Infof("Skipping Pod %s, Namespace %s due to no matching container",
+				ip.Name, ip.Namespace)
+			continue
+		}
+		if ip.IP == "" {
+			log.Infof("Skipping Pod %s, Namespace %s due to no IP",
+				ip.Name, ip.Namespace)
+			continue
+		}
+		log.Infof("Recovered AddNetwork for Pod %s, Namespace %s, Container %s",
+			ip.Name, ip.Namespace, ip.Container)
 		_, _, err = c.dataStore.AssignPodIPv4Address(ip)
 		if err != nil {
 			ipamdErrInc("nodeInitAssignPodIPv4AddressFailed", err)
@@ -213,6 +230,48 @@ func (c *IPAMContext) nodeInit() error {
 	}
 
 	return nil
+}
+
+func (c *IPAMContext) getLocalPodsWithRetry() ([]*k8sapi.K8SPodInfo, error) {
+	var pods []*k8sapi.K8SPodInfo
+	var err error
+	for retry := 1; retry <= maxK8SRetries; retry++ {
+		pods, err = c.k8sClient.K8SGetLocalPodIPs()
+		if err == nil {
+			break
+		}
+		log.Infof("Not able to get local pods yet (attempt %d/%d): %v", retry, maxK8SRetries, err)
+		time.Sleep(retryK8SInterval)
+	}
+
+	if pods == nil {
+		return nil, errors.New("unable to get local pods, giving up")
+	}
+
+	var containers map[string]*docker.ContainerInfo
+
+	for retry := 1; retry <= maxK8SRetries; retry++ {
+		containers, err = c.dockerClient.GetRunningContainers()
+		if err == nil {
+			break
+		}
+		log.Infof("Not able to get local containers yet (attempt %d/%d): %v", retry, maxK8SRetries, err)
+		time.Sleep(retryK8SInterval)
+	}
+
+	// TODO consider using map
+	for _, pod := range pods {
+		// needs to find the container ID
+		for _, container := range containers {
+			if container.K8SUID == pod.UID {
+				log.Debugf("Found pod(%v)'s container ID: %v ", container.Name, container.ID)
+				pod.Container = container.ID
+				break
+			}
+		}
+	}
+
+	return pods, nil
 }
 
 // StartNodeIPPoolManager monitors the IP Pool, add or del them when it is required.
@@ -243,21 +302,21 @@ func (c *IPAMContext) retryAllocENIIP() {
 	}
 	eni := c.dataStore.GetENINeedsIP(maxIPLimit)
 	if eni != nil {
-		log.Debugf("Attempt again to allocate IP address for eni :%s", eni.Id)
-		err := c.awsClient.AllocAllIPAddress(eni.Id)
+		log.Debugf("Attempt again to allocate IP address for eni :%s", eni.ID)
+		err := c.awsClient.AllocAllIPAddress(eni.ID)
 		if err != nil {
 			ipamdErrInc("retryAllocENIIPAllocAllIPAddressFailed", err)
 			log.Warn("During eni repair: error encountered on allocate IP address", err)
 			return
 		}
-		ec2Addrs, _, err := c.getENIaddresses(eni.Id)
+		ec2Addrs, _, err := c.getENIaddresses(eni.ID)
 		if err != nil {
 			ipamdErrInc("retryAllocENIIPgetENIaddressesFailed", err)
 			log.Warn("During eni repair: failed to get ENI ip addresses", err)
 			return
 		}
 		c.lastNodeIPPoolAction = time.Now()
-		c.addENIaddressesToDataStore(ec2Addrs, eni.Id)
+		c.addENIaddressesToDataStore(ec2Addrs, eni.ID)
 	}
 }
 
@@ -396,7 +455,7 @@ func (c *IPAMContext) addENIaddressesToDataStore(ec2Addrs []*ec2.NetworkInterfac
 	return primaryIP
 }
 
-// returns all addresses on eni, the primary adderss on eni, error
+// returns all addresses on eni, the primary address on eni, error
 func (c *IPAMContext) getENIaddresses(eni string) ([]*ec2.NetworkInterfacePrivateIpAddress, string, error) {
 	ec2Addrs, _, err := c.awsClient.DescribeENI(eni)
 	if err != nil {
@@ -466,7 +525,7 @@ func logPoolStats(total, used, currentMaxAddrsPerENI, maxAddrsPerENI int) {
 		total, used, currentMaxAddrsPerENI, maxAddrsPerENI)
 }
 
-//nodeIPPoolTooLow returns true if IP pool is below low threshhold
+//nodeIPPoolTooLow returns true if IP pool is below low threshold
 func (c *IPAMContext) nodeIPPoolTooLow() bool {
 	warmENITarget := getWarmENITarget()
 	total, used := c.dataStore.GetStats()
@@ -476,7 +535,7 @@ func (c *IPAMContext) nodeIPPoolTooLow() bool {
 	return (available <= c.currentMaxAddrsPerENI*warmENITarget)
 }
 
-// NodeIPPoolTooHigh returns true if IP pool is above high threshhold
+// NodeIPPoolTooHigh returns true if IP pool is above high threshold
 func (c *IPAMContext) nodeIPPoolTooHigh() bool {
 	warmENITarget := getWarmENITarget()
 	total, used := c.dataStore.GetStats()
@@ -581,7 +640,7 @@ func (c *IPAMContext) eniIPPoolReconcile(ipPool map[string]*datastore.AddressInf
 		if err != nil {
 			log.Errorf("Failed to reconcile IP %s on eni %s", localIP, eni)
 			ipamdErrInc("ipReconcileAdd", err)
-			// contine instead of bailout due to one ip
+			// continue instead of bailout due to one ip
 			continue
 		}
 		reconcileCnt.With(prometheus.Labels{"fn": "eniIPPoolReconcileAdd"}).Inc()
@@ -596,7 +655,7 @@ func (c *IPAMContext) eniIPPoolReconcile(ipPool map[string]*datastore.AddressInf
 		if err != nil {
 			log.Errorf("Failed to reconcile and delete IP %s on eni %s, %v", existingIP, eni, err)
 			ipamdErrInc("ipReconcileDel", err)
-			// contine instead of bailout due to one ip
+			// continue instead of bailout due to one ip
 			continue
 		}
 		reconcileCnt.With(prometheus.Labels{"fn": "eniIPPoolReconcileDel"}).Inc()
